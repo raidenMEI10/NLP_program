@@ -3,12 +3,15 @@ import re
 import torch
 from sentence_transformers import SentenceTransformer,util
 from torch import optim, autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification
 
 from Datas.QA_dataset import QADataset
 from Datas.big_dataset import BIGDataset
+from utils.baseloss import MultiDSCLoss
 from utils.model_utils import XFBert
+from sklearn.metrics import f1_score
 
 
 def process_string(s, n_number):
@@ -36,40 +39,44 @@ def read_file_continuously(file_path,index):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-def getF1_score(prediction, ground_truth):
-    pred_tokens = prediction.split()
-    gt_tokens = ground_truth.split()
 
-    # 创建集合以消除重复
-    pred_set = set(pred_tokens)
-    gt_set = set(gt_tokens)
-
-    # 计算true positives, false positives, and false negatives
-    tp = len(pred_set & gt_set)
-    fp = len(pred_set - gt_set)
-    fn = len(gt_set - pred_set)
-
-    # 如果没有正样本或预测样本
-    if tp + fp == 0 or tp + fn == 0:
-        return 0.0
-
-    precision = tp / (tp + fp)
-    recall = tp / (tp + fn)
-
-    if precision + recall == 0:
-        return 0.0
-
-    f1 = 2 * (precision * recall) / (precision + recall)
-    return f1
 
 def eval(pretrain_model, model,test_loader):
-    score = 0
-    questions = []
-    answers = []
+    precision = 0
+
+    pred = []
+    gt = []
+
+    model.load_state_dict(torch.load("bert.pth"))
+
+    model.eval()
     eval_loop = tqdm(test_loader)
     for query in test_loader:
-        questions.append(query[0])
-        answers.append(query[1])
+        # questions.append(query[0])
+        # answers.append(query[1])
+        text = query[0]+query[1] #query[0]为问题， query[1]为依据, query[3]为"Yes"或"No"
+        label = query[2]
+        # text = model.encode(text, convert_to_tensor=True).to('cuda') 需要embedding加下面这句
+
+        output = model(text)
+
+        if label == 'Yes':
+            if output == 1:
+                pred.append(1)
+                precision+=1
+            else:
+                pred.append(0)
+            gt.append(1)
+        else:
+            if output == 1:
+                pred.append(1)
+            else:
+                pred.append(0)
+                precision += 1
+            gt.append(0)
+
+
+        f1 = f1_score(gt,pred)
 
         # query_embedding = model.encode(question, convert_to_tensor=True).to('cuda')
         #
@@ -80,20 +87,23 @@ def eval(pretrain_model, model,test_loader):
         #
         # f1 = getF1_score(result, answer)
         # score += f1/len(test_loader)
-    query_embeddings = model.encode(questions)
-    hits = util.semantic_search(query_embeddings, corpus_embeddings)
-    for i in range(hits):
-        result = corpus(hits[i]['corpus_id'])
-        f1 = getF1_score(result, answers[i])
-        score += f1/len(test_loader)
+    # query_embeddings = model.encode(questions)
+    # hits = util.semantic_search(query_embeddings, corpus_embeddings)
+    # for i in range(hits):
+    #     result = corpus(hits[i]['corpus_id'])
+    #     f1 = getF1_score(result, answers[i])
+    #     score += f1/len(test_loader)
 
 
 
-    return score
+    return score/len(test_loader),f1_score
 
 def train(dataloader,pre_train_model, model, epoch, optimizer, loss):
     iterator = tqdm(range(dataloader), ncols=70)
+    device = 'cuda'
     model.to('cuda')
+    intent_loss_fct = MultiDSCLoss(alpha=0.3, smooth=1.0)
+    scaler = GradScaler()
 
     for i in range(epoch):
         model.train()
@@ -101,12 +111,22 @@ def train(dataloader,pre_train_model, model, epoch, optimizer, loss):
         optimizer.zero_grad()
         for step, batch in tqdm(enumerate(dataloader, start=1)):
             with autocast():
-                print(batch)
-                intent_logits = model()
-                # intent_loss = intent_loss_fct(intent_logits.view(-1, len(intent2id)), intent_labels)
-                # loss = intent_loss
+                # text[0]为问题， text[1]为依据, text[3]为正确或错误
 
-            # scaler.scale(loss).backward()
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                intent_labels = batch['intent_labels'].to(device)
+                intent_logits = model()
+                intent_loss = intent_loss_fct(intent_logits.view(-1, 2), intent_labels)
+                loss = intent_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            model.zero_grad()
+
+    print('save model ...')
+    torch.save(model.state_dict(), "bert.pth")
 
 
 
@@ -144,8 +164,8 @@ if __name__ == '__main__':
 
     # print(embeddings.shape)
     print("training ends, starting eval")
-    score = eval(pre_train_model, model, test_loader)
-    print("the eval score is "+str(score))
+    precision, f1_score = eval(pre_train_model, model, test_loader)
+    print("the eval precision is "+str(precision)+" f1 score is "+str(f1_score))
 
 
 
