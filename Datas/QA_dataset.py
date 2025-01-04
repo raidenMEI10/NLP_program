@@ -55,7 +55,7 @@ class QADataset(Dataset):
         super().__init__()
         self.corpus_path = corpus_path
         self.text_len = text_len
-        self.corpus = read_file_continuously(self.corpus_path)
+        self.corpus = read_file_continuously(self.corpus_path,self.text_len)
 
     def __getitem__(self, index):
 
